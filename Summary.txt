@@ -51,6 +51,11 @@ Note: needs the `ffmpeg` binary installed (brew install ffmpeg), and
 `setuptools<81` in the venv (webrtcvad still imports the old
 pkg_resources).
 
+In Short 
+
+1. Take the audio (mp3, wav, m4a, phone formats) → convert to the one standard format the model reads.
+2. Check how much of it is actual speech (not silence/noise)
+
 Next steps (not done yet):
 - Fill in the quality-check and model inference code.
 - Wire up the POST /analyze endpoint and the websocket.
