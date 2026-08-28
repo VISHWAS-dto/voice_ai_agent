@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      HF_HOME: /models/hf
+      TORCH_HOME: /models/torch
+    volumes:
+      - ./:/app
+      - model-cache:/models
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+
+volumes:
+  model-cache:

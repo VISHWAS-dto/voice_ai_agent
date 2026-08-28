@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+torch
+torchaudio
+transformers
+webrtcvad
+numpy
+ffmpeg-python
+pytest
+httpx
