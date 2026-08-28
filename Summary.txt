@@ -1,0 +1,60 @@
+SUMMARY - What was done so far
+==============================
+
+In one line:
+Set up the skeleton of a voice analysis service that will listen to an
+audio clip and guess the speaker's gender and age range.
+
+A bit more detail:
+- Created a FastAPI project structure (folders for API, audio handling,
+  and the ML model).
+- Most files are empty "stubs" (placeholders) for now - the real logic
+  is not written yet.
+- The ONE thing that is actually done: app/schemas/models.py, which
+  defines the shape of the API response:
+    * predicted gender + how confident
+    * predicted age bracket + how confident
+    * how long processing took
+    * a rating of the audio quality
+- Added supporting files: README, Dockerfile, docker-compose,
+  requirements.txt, and a basic test for the response shape.
+- scripts/test_model_load.py is an untracked helper script for trying
+  out loading the model.
+
+PHASE 2 - Audio ingestion (DONE)
+================================
+
+In one line:
+Wrote the code that takes any audio clip and turns it into a clean,
+standard format the model can read, plus a check for how much of the
+clip is actual speech.
+
+A bit more detail (app/audio/ingest.py):
+- normalize_audio(bytes): feeds the raw audio (mp3, wav, m4a, or phone
+  formats like 8kHz mu-law) through ffmpeg and gets back a 16kHz mono
+  waveform. Everything happens in memory via pipes - nothing is ever
+  saved to disk (the audio can contain private customer info).
+  Throws a clear AudioDecodeError if the input is empty or corrupt.
+- run_vad(waveform): uses webrtcvad to measure speech vs silence and
+  returns total length, speech length, speech ratio (0-1), and how many
+  separate speech chunks there are. Short or silent clips return a
+  ratio of 0.0 instead of crashing.
+  (webrtcvad picked over silero-vad: no model download, no torch, fast
+  and predictable - it's just a rough "is there enough speech?" gate.)
+- Pure, testable functions only - no API/route code, no global state.
+
+Also added scripts/test_ingest.py: a manual test that runs a sample WAV
+through both functions and prints the stats, and checks that silent /
+empty / corrupt buffers are handled gracefully.
+
+Note: needs the `ffmpeg` binary installed (brew install ffmpeg), and
+`setuptools<81` in the venv (webrtcvad still imports the old
+pkg_resources).
+
+Next steps (not done yet):
+- Fill in the quality-check and model inference code.
+- Wire up the POST /analyze endpoint and the websocket.
+
+>>> python scripts/test_model_load.py --file path/to/sample.wav
+>>> python scripts/test_ingest.py path/to/sample.wav
+

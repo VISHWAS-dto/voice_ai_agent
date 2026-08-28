@@ -31,6 +31,7 @@ htmlcov/
 .cache/
 models/
 model_cache/
+.model_cache/
 hf_cache/
 .huggingface/
 transformers_cache/
