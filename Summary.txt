@@ -57,9 +57,83 @@ In Short
 2. Check how much of it is actual speech (not silence/noise)
 
 Next steps (not done yet):
-- Fill in the quality-check and model inference code.
+- Fill in the quality-check code (app/audio/quality.py).
 - Wire up the POST /analyze endpoint and the websocket.
 
 >>> python scripts/test_model_load.py --file path/to/sample.wav
 >>> python scripts/test_ingest.py path/to/sample.wav
+>>> python scripts/test_inference.py path/to/sample.wav
+
+PHASE 3 - Model inference wrapper (DONE)
+=======================================
+
+In one line:
+Wrote the code that actually runs the ML model on a cleaned-up waveform
+and turns its raw numbers into "male/female + age bracket + how sure".
+
+A bit more detail (app/inference/model.py):
+- AttributeInferencer class:
+  * __init__ loads "audeering/wav2vec2-large-robust-24-ft-age-gender"
+    once, on startup, into .model_cache/ (~1.3 GB). Fails fast with a
+    clear RuntimeError if the model can't load, rather than per request.
+  * predict(waveform, sample_rate=16000) -> dict with:
+      gender_prediction  : "male" | "female" | "unknown"
+      gender_confidence  : 0-1 (the softmax prob of the reported class)
+      age_bracket        : "18-30" | "31-45" | "46-60" | "60+" | "unknown"
+      age_confidence     : 0-1 (a modest heuristic, see below)
+      inference_ms       : time in the model forward pass ONLY
+                           (preprocessing + bucket mapping excluded)
+  * The class holds only the model weights across calls - nothing
+    per-request is cached.
+- Why this model: the backbone (wav2vec2-large-ROBUST) was pre-trained
+  on messy audio including telephone speech (Switchboard/Fisher), so it
+  holds up on 8 kHz G.711 call-center audio, codec noise and cross-talk
+  far better than a clean-studio model. One forward pass, two heads
+  (age regression + 3-class gender) = both attributes cheaply.
+- Gender: the model has a 3rd class, "child". We map a child-dominant
+  prediction (and any malformed output) to "unknown" - the API has no
+  "child" value and the child probability is not a male/female
+  confidence, so we don't surface it.
+- Age bucketing: the age head is a regression (value * 100 = years). We
+  bucket by predicted year using the brackets' own edges (boundary year
+  falls in the lower bracket: 30 -> "18-30"). Predicted age < 18 ->
+  "unknown" (we only score adult callers). age_confidence has no real
+  posterior behind it, so it's a deliberately capped proxy (~0.30 on a
+  bracket edge, ~0.65 dead-centre, never near 1.0) for "how interior to
+  the bucket is the estimate" - silence regresses mid-bracket and must
+  not read as confident.
+- The whole forward pass is wrapped in try/except: on ANY failure it
+  returns "unknown"/0.0 for both fields instead of crashing.
+
+Also:
+- scripts/test_inference.py: loads AttributeInferencer once, runs
+  predict() on sample.wav (prints full dict + total time), then on a
+  synthetic 3 s silent buffer (confirms no crash + low-confidence
+  /unknown output).
+- Fixed a transformers-5 incompat in both the model wrapper and
+  scripts/test_model_load.py: the audeering model card calls the legacy
+  self.init_weights(); on transformers >= 5 that skips setup
+  from_pretrained needs, so use self.post_init() instead.
+
+
+Summary of Phase 1 &n 2
+
+Phase 1 — the skeleton
+- Built the folder/file structure for the service (API, audio, model, tests).
+- Most files are empty stubs — no real logic yet.
+- The one real piece: app/schemas/models.py, which defines the shape of the answer the service will return — predicted gender + confidence, predicted age bracket + confidence, processing time, and an audio-quality rating.
+- Plus setup files: README, Dockerfile, docker-compose, requirements.txt.
+
+Phase 2 — audio ingestion (the "take the audio in" step)
+- Wrote real code (app/audio/ingest.py):
+  a. Take an audio clip in any common format (mp3, m4a, wav, phone formats like 8 kHz G.711) and convert it to one standard format the model needs (16 kHz, mono, float32) — done in memory, never saved to disk.
+  b. Check how much of the clip is actual speech vs. silence/noise.
+- Plus a manual test script.
+
+Phase 3 — model inference wrapper (the "run the model" step)
+- Wrote real code (app/inference/model.py):
+  a. AttributeInferencer loads the audeering wav2vec2 age/gender model once on startup.
+  b. predict(waveform) runs it and returns male/female + age bracket, each with a confidence, plus the forward-pass time in ms.
+  c. Model picked for robustness to noisy/telephone audio; a "child" gender class and any model failure both fold to "unknown".
+- Plus a manual test script (scripts/test_inference.py).
 

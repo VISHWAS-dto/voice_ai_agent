@@ -85,7 +85,9 @@ class AgeGenderModel(Wav2Vec2PreTrainedModel):
         self.wav2vec2 = Wav2Vec2Model(config)
         self.age = ModelHead(config, 1)
         self.gender = ModelHead(config, 3)
-        self.init_weights()
+        # transformers >= 5: use post_init() rather than the legacy
+        # init_weights(), which no longer sets up all_tied_weights_keys.
+        self.post_init()
 
     def forward(self, input_values):
         outputs = self.wav2vec2(input_values)
