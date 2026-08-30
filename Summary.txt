@@ -137,3 +137,55 @@ Phase 3 — model inference wrapper (the "run the model" step)
   c. Model picked for robustness to noisy/telephone audio; a "child" gender class and any model failure both fold to "unknown".
 - Plus a manual test script (scripts/test_inference.py).
 
+PHASE 4 - Quality gate + real /analyze endpoint (DONE)
+=====================================================
+
+In one line:
+Wrote the "is this clip good enough?" check and connected all the pieces
+into a working POST /analyze endpoint.
+
+A bit more detail:
+- app/audio/quality.py: assess_quality(vad_stats) looks at how much of
+  the clip is speech and returns one of:
+    * "good"         - at least half the clip is speech
+    * "degraded"     - some speech (15-50%), likely noisy/intermittent
+    * "insufficient" - almost no speech, or clip shorter than 0.5s
+  Thresholds are a hand-picked starting point, not tuned on labeled
+  data yet (noted as a limitation in the README).
+- app/api/routes.py: POST /analyze now actually works:
+    1. Reads the uploaded file into memory - never saved to disk.
+    2. Makes a fresh contact_id (uuid) per request.
+    3. Decodes the audio; if it's corrupt/empty, returns
+       "insufficient" + unknown instead of an error.
+    4. Runs VAD + quality check.
+    5. If "insufficient", skips the model entirely (saves compute,
+       avoids confident guesses on silence).
+    6. Otherwise runs the model.
+    7. Times the whole thing (not just the model).
+    8. Wrapped in a catch-all: ANY unexpected error still returns a
+       200 with all-unknown fields, never a 500 - this is a soft
+       signal that must not break the caller.
+    9. Logs contact_id, quality, timing, predictions - NEVER the audio.
+- app/main.py: loads the model ONCE at startup (FastAPI lifespan) and
+  reuses it for every request, so no multi-second cold start per call.
+- tests/test_analyze.py: uploads sample.wav and checks the response
+  shape/values; uploads a corrupt file and an empty file and checks
+  both come back as "insufficient" gracefully (no 500). All pass.
+
+The service is now end-to-end functional: upload audio -> get back
+gender + age bracket + confidence + quality rating.
+
+uvicorn app.main:app --reload
+
+curl -X POST http://localhost:8000/analyze \
+  -F "file=@sample.wav" \
+  | python -m json.tool
+
+  pytest tests/test_analyze.py -v
+
+
+  ls -lh sample.wav
+
+  curl -L -o sample.wav "https://raw.githubusercontent.com/mozilla/DeepSpeech/master/data/smoke_test/LDC93S1.wav"
+
+  ls -lh sample.wav
