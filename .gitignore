@@ -42,7 +42,11 @@ torch_cache/
 *.safetensors
 
 # Local eval data / outputs
-eval/datasets/
+# The manifest is checked in; the (potentially large, potentially
+# licence-encumbered) audio files it points to are not.
+eval/datasets/*
+!eval/datasets/manifest.csv
+!eval/datasets/README.md
 eval/reports/
 
 # Editor / OS
