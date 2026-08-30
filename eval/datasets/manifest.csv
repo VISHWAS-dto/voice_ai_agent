@@ -1,0 +1,40 @@
+# Eval manifest for eval/run_eval.py
+#
+# One row per labeled test clip. Lines starting with '#' and blank lines are ignored.
+#
+# Columns:
+#   path          - path to the audio file. Relative paths are resolved against
+#                   the repo root (the parent of eval/). Any format ffmpeg can
+#                   read (wav/mp3/m4a/ogg/opus/flac/...).
+#   gender        - ground-truth speaker gender: male | female
+#                   (use "unknown" only if you genuinely cannot tell; such rows
+#                    are excluded from gender accuracy)
+#   age_bracket   - ground-truth age bracket, one of: 18-30 | 31-45 | 46-60 | 60+
+#                   (leave blank if you don't have a reliable age; the row is
+#                    then excluded from age accuracy but still used for gender)
+#   verified      - yes | no. "no" = best-effort label, not independently
+#                   confirmed. run_eval.py reports verified and unverified
+#                   rows both together and separately, so a pile of guessed
+#                   labels can't quietly inflate the headline number.
+#   notes         - free text, for your own reference. No commas.
+#
+# ---------------------------------------------------------------------------
+# HONEST LIMITATIONS OF THIS SET (read eval/README.md for the full write-up):
+#
+#   * It is TINY. As shipped it has ONE clip. Even filled out to 10-20 it is
+#     nowhere near a statistically meaningful sample - treat every number
+#     run_eval.py prints as anecdotal, not as "the model is X% accurate".
+#   * Mozilla Common Voice (the obvious real source of age/gender-labeled
+#     speech) is now a GATED dataset on the Hugging Face Hub: pulling it
+#     needs an account, an access token, and accepting the dataset terms,
+#     plus the `datasets` library and a multi-GB download. That was judged
+#     too heavy to wire in as a zero-setup default. If you DO have a token,
+#     see the `--commonvoice` note in run_eval.py for how to extend this.
+#   * The one bundled clip (sample.wav = the LDC93S1 TIMIT smoke-test
+#     sentence) has verified=no: it is widely used as a male-speaker example
+#     but the label here has not been independently checked, and there is no
+#     published age for the speaker, so age_bracket is a guess.
+# ---------------------------------------------------------------------------
+#
+# path,gender,age_bracket,verified,notes
+sample.wav,male,31-45,no,LDC93S1 TIMIT SA1 sentence - commonly cited as a male speaker - age unpublished so bracket is a guess

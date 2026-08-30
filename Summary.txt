@@ -343,3 +343,128 @@ Commands:
   curl -s http://localhost:8000/health
   curl -s -X POST http://localhost:8000/analyze -F "audio=@sample.wav;type=audio/wav"
   pytest tests/ -v
+
+
+PHASE 6 - Tests + Eval harness (DONE)
+====================================
+
+In one line:
+Wrote the tests that prove each piece behaves, and a small honest
+"report card" script that scores the model on labeled clips.
+
+Think of it like this:
+Phases 1-5 built and hardened the machine. Phase 6 is the inspection:
+a checklist that each part passes (unit + integration tests) and a
+one-page report on how well the AI actually guesses (the eval harness).
+
+------------------------------------------------------------------
+PART A - Unit tests for the quality gate (tests/test_quality.py)
+------------------------------------------------------------------
+
+The "is this clip good enough?" function (assess_quality) has a few
+simple rules. These 27 tiny tests check every rule and, importantly,
+every exact edge:
+
+  - lots of speech (>= 50% of the clip)      -> "good"
+  - some speech (15% - 50%)                  -> "degraded"
+  - almost no speech (< 15%)                 -> "insufficient"
+  - clip shorter than 0.5 seconds           -> "insufficient"
+                                               (no matter how much speech)
+  - less than 0.5s of actual speech          -> "insufficient"
+
+We pin the exact boundary behaviour (exactly 0.15 and exactly 0.5) so
+that if someone later retunes those numbers, a test lights up and it's
+a deliberate change, not an accident. Also checks the function doesn't
+crash on a broken/empty input.
+
+------------------------------------------------------------------
+PART B - Integration tests for the API (tests/test_analyze.py)
+------------------------------------------------------------------
+
+These start the real app (real model loaded once) and poke it like a
+real caller would:
+
+  1. Upload sample.wav -> expect HTTP 200, and a response that has all
+     the right fields: a valid random ID (uuid4), a gender that is
+     male / female / unknown, an age bracket that is one of the four
+     buckets or unknown, confidence numbers that are real decimals
+     between 0 and 1, and a processing time. Also: every request gets
+     its OWN fresh ID.
+  2. Upload a corrupt file, then an empty file -> expect HTTP 200
+     (NOT a 500 error), quality = "insufficient", gender/age = unknown.
+     The service must degrade politely, never blow up on the caller.
+  3. GET /health -> expect 200 with model_loaded: true.
+
+Note: the upload field is named "audio" (not "file").
+
+------------------------------------------------------------------
+PART C - Eval harness (eval/run_eval.py)
+------------------------------------------------------------------
+
+What it does:
+  - Reads a list of labeled clips (eval/datasets/manifest.csv): each row
+    is a file path + the true gender + true age bracket.
+  - Runs each clip straight through the model (not the web API - we're
+    testing the model, not FastAPI).
+  - Prints a small report:
+      * gender accuracy - % it got right, counting only the clips where
+        it actually committed to male/female. How often it said
+        "unknown" is reported SEPARATELY (an "I don't know" is not a
+        wrong answer and not a right one).
+      * age-bracket accuracy - same idea, exact bracket match.
+      * a calibration check - it groups predictions by the confidence
+        the model reported (0.5-0.6, 0.6-0.7, ...) and shows the real
+        hit-rate in each group. If it says "0.9 confident" a lot but is
+        only right 60% of the time, the confidence number is not
+        trustworthy - this table is where you'd see that.
+  - One bad/missing/corrupt clip is logged and skipped - it never
+    crashes the whole run.
+  - Optional: --json dumps the raw per-clip results.
+
+HONEST limitations (say these out loud in the README / video):
+  - It's a STUB eval on a TINY hand-picked set. As shipped it has ONE
+    clip (sample.wav). Even at 10-20 clips it's an anecdote, not a real
+    benchmark - the error bars on an accuracy from ~15 samples are
+    roughly +/- 25 points.
+  - No class balance: 12 men + 2 women would let a "always male" model
+    score 86% and teach us nothing.
+  - The bundled label is unverified (marked verified=no) - sample.wav
+    is widely cited as a male speaker but not independently checked, and
+    the speaker's age is unpublished so the bracket is a guess. The
+    report shows "verified-only" numbers separately for this reason.
+  - Why not Mozilla Common Voice out of the box? Every current version
+    is a GATED dataset on Hugging Face now - needs an account, a token,
+    an accepted licence, the `datasets` library, and a multi-GB
+    download. Deliberately NOT wired in so the script runs with zero
+    setup. `python eval/run_eval.py --help` prints the ~15 lines to
+    extend it from Common Voice if you have a token (and a warning that
+    CV's self-reported labels skew young + male).
+
+What we saw on the one bundled clip: the model returned gender=unknown
+(its internal "child" class won) and age=18-30 for a ~46-year-old male
+TIMIT speaker - a concrete example of it struggling on short, 16 kHz,
+telephone-ish audio. Exactly the kind of thing a real eval set would
+quantify.
+
+------------------------------------------------------------------
+Files added / changed in Phase 6
+------------------------------------------------------------------
+  NEW  tests/test_quality.py         - 27 unit tests for assess_quality
+  NEW  eval/run_eval.py              - the offline eval harness
+  NEW  eval/datasets/manifest.csv    - labeled-clip manifest (1 row shipped)
+  EDIT tests/test_analyze.py         - fleshed out to the full checklist
+  EDIT eval/README.md                - how to run + honest limitations
+  EDIT .gitignore                    - check in manifest.csv, not the audio
+
+Test suite result: 38 passed, 1 skipped (the old test_schemas.py stub,
+left untouched).
+
+Commands:
+  pytest tests/ -v
+  pytest tests/test_quality.py -v
+  pytest tests/test_analyze.py -v
+  python eval/run_eval.py
+  python eval/run_eval.py --json eval/reports/run.json
+  python eval/run_eval.py --help          # includes the Common Voice how-to
+
+
