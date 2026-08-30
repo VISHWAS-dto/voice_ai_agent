@@ -44,6 +44,7 @@ the process lifetime.
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -62,7 +63,14 @@ TARGET_SAMPLE_RATE = 16_000
 # Weights are cached here so the first process to run pays the download and
 # every process after that loads from local disk. Kept inside the repo (and
 # .gitignored) so it survives across container rebuilds when mounted.
-CACHE_DIR = Path(__file__).resolve().parents[2] / ".model_cache"
+#
+# Override with MODEL_CACHE_DIR — the Dockerfile sets it to a fixed path
+# (/app/.model_cache) that docker-compose mounts as a named volume, so
+# weights persist across container restarts without re-downloading.
+CACHE_DIR = Path(
+    os.getenv("MODEL_CACHE_DIR")
+    or (Path(__file__).resolve().parents[2] / ".model_cache")
+)
 
 # --- gender head label order -------------------------------------------------
 # Per the model card, the 3-class gender softmax is ordered:
@@ -401,3 +409,14 @@ def _map_age(value: float) -> tuple[str, float]:
     # years >= _AGE_MIN_YEARS but fell through every bracket: only possible
     # if the bounds table is edited inconsistently. Be safe.
     return "unknown", 0.0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    # Entry point for the Docker build's weight pre-download step:
+    #   python -m app.inference.model
+    # Constructing the inferencer downloads ~1.3 GB into CACHE_DIR and
+    # verifies the custom architecture actually loads, so a broken model
+    # fails the image build rather than the first container start.
+    print(f"pre-downloading {MODEL_NAME} into {CACHE_DIR} ...")
+    AttributeInferencer()
+    print("model weights cached and load verified.")

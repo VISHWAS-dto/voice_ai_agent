@@ -33,10 +33,47 @@ decode failure) **skips the model** and returns `unknown` / `unknown` at
 `0.0` confidence. `processing_ms` is end-to-end (ingest + VAD + inference).
 
 The endpoint always responds **HTTP 200**: unusable audio, corrupt uploads,
-and unexpected internal errors all resolve to an all-`unknown` body rather
-than an error status, so a failure here never breaks the calling voice AI
-system. The model is loaded once at startup (FastAPI lifespan), not
-per-request.
+a processing timeout, and unexpected internal errors all resolve to an
+all-`unknown` body (with `audio_quality: "insufficient"`) rather than an
+error status, so a failure here never breaks the calling voice AI system.
+The model is loaded once at startup (FastAPI lifespan), not per-request.
+
+### Reliability
+
+- **Never a 500.** The handler has a top-level `try/except` that catches
+  *any* exception and returns the all-`unknown` / `insufficient` body.
+- **Never hangs.** The decode → VAD → inference pipeline runs in a worker
+  thread under a hard 3 s wall-clock budget (`_PROCESSING_BUDGET_S` in
+  `app/api/routes.py`). On overrun the request returns the safe body
+  immediately; the orphaned thread finishes and is discarded (the pipeline
+  holds no shared mutable state).
+- **Model loaded once.** `app/main.py`'s lifespan builds the
+  `AttributeInferencer` on startup and stashes it on `app.state`. The
+  process is not marked ready until the ~1.3 GB of weights are resident, so
+  no request pays the cold-start cost.
+
+### `GET /health`
+
+Container health/readiness probe. `{"status": "ok", "model_loaded": <bool>}`.
+`model_loaded` is `true` only after the startup lifespan has finished
+loading the model. (`GET /healthz` is a backwards-compatible alias.)
+
+### Observability
+
+Every `/analyze` request emits exactly **one structured JSON log line** on
+stdout (`app/logging_config.py`) with: `contact_id`, `audio_quality`,
+`gender_prediction`, `age_prediction`, `processing_ms`, `inference_ms`, and
+`outcome` (`ok` / `degraded` / `error_fallback`). Levels:
+
+| Level     | When                                                        |
+|-----------|-------------------------------------------------------------|
+| `INFO`    | normal request, `good` audio                               |
+| `WARNING` | `degraded` / `insufficient` audio, decode failure, timeout |
+| `ERROR`   | the exception fallback path                                 |
+
+The **only** identifier logged is the generated `contact_id`. The upload's
+filename, byte content, and any transcript are never logged. Set
+`LOG_LEVEL` (default `INFO`) to change verbosity.
 
 #### Limitations
 
@@ -72,11 +109,33 @@ uvicorn app.main:app --reload
 
 ## Docker
 
-_TODO_
-
 ```bash
 docker compose up --build
 ```
+
+The image (`Dockerfile`):
+
+- `python:3.11-slim` base.
+- Installs **ffmpeg** via `apt-get` — it's a system binary the audio
+  ingestion shells out to, not a pip package.
+- Installs `requirements.txt`, then copies the app.
+- **Pre-downloads the ~1.3 GB HF model weights at build time** into a seed
+  path baked into the image, and pins `HF_HUB_OFFLINE=1` for the runtime.
+  Tradeoff: bigger image + a network-dependent build, in exchange for a
+  first container start that needs no network and reports
+  `model_loaded: true` within a second or two. The alternative
+  (download-on-first-start) makes the first request block on a multi-second
+  download that fails outright with no egress — see the comment in the
+  Dockerfile.
+- `docker-entrypoint.sh` seeds the runtime cache (`/app/.model_cache`, a
+  compose-mounted named volume) from the baked copy on first run, so
+  restarts reuse the volume instead of re-downloading.
+- Exposes `8000`, runs `uvicorn app.main:app` as `CMD`.
+
+`docker-compose.yml` builds from the Dockerfile, maps `8000:8000`, mounts
+the `model-cache` named volume at `/app/.model_cache` so weights persist
+across `down`/`up`, and adds a `/health`-based healthcheck (the container
+is only `healthy` once the model has loaded).
 
 ## Testing
 

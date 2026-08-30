@@ -5,17 +5,22 @@ lifecycle: the ~1.3 GB ``AttributeInferencer`` is loaded **once** in the
 lifespan startup handler and stashed on ``app.state.inferencer`` so every
 ``POST /analyze`` reuses it. Loading per-request would add a multi-second
 cold start to every call.
+
+Structured JSON logging is installed before the model load so even startup
+lines are machine-parseable — see ``app.logging_config``.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.api import routes, websocket
 from app.inference.model import AttributeInferencer
+from app.logging_config import configure_logging
 
 logger = logging.getLogger("app.main")
 
@@ -29,6 +34,9 @@ async def lifespan(app: FastAPI):
     until the model is actually usable, and no request ever pays that
     cost.
     """
+    configure_logging(
+        level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+    )
     logger.info("startup: loading AttributeInferencer (one-time model load)")
     app.state.inferencer = AttributeInferencer()
     logger.info("startup: model loaded, service ready")

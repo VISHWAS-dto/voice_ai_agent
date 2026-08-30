@@ -189,3 +189,157 @@ curl -X POST http://localhost:8000/analyze \
   curl -L -o sample.wav "https://raw.githubusercontent.com/mozilla/DeepSpeech/master/data/smoke_test/LDC93S1.wav"
 
   ls -lh sample.wav
+
+PHASE 5 - Reliability, Observability & Dockerization (DONE)
+==========================================================
+
+In one line:
+Made the service tough enough to ship: it never crashes the caller, it
+never hangs, it writes clean logs you can search, and it now runs the
+same way inside a container as it does on a laptop.
+
+Think of it like this:
+Phases 1-4 built a working machine. Phase 5 bolts on the seatbelts, the
+dashboard warning lights, and puts the whole thing in a shipping crate
+so it arrives in one piece anywhere.
+
+------------------------------------------------------------------
+PART A - Reliability ("it must not break the thing calling it")
+------------------------------------------------------------------
+
+This service is a *helper* for a live voice AI system. If our helper
+falls over, the phone call must NOT fall over with it. So:
+
+1. Never returns an error.
+   No matter what goes wrong inside - a bad audio file, a bug, the model
+   choking - the service still answers politely with "I don't know"
+   (gender = unknown, age = unknown, quality = "insufficient"). The
+   caller gets a normal, usable answer every single time.
+
+2. Never hangs.
+   We put a 3-second stopwatch on the whole process. If analysing a clip
+   somehow takes longer than that, we stop waiting and immediately send
+   back an "I don't know" answer instead of leaving the caller hanging
+   on the line. (The slow work quietly finishes in the background and is
+   thrown away.)
+
+3. The model is loaded ONCE, at startup - confirmed.
+   The AI model is about 1.3 GB and takes a few seconds to load. We load
+   it a single time when the service boots up, then reuse it for every
+   request. We double-checked the earlier "3.4 seconds on the first
+   call" worry: that delay was the service *starting up*, not something
+   that happens on every call. Normal calls take a few hundred
+   milliseconds.
+
+4. New "/health" check.
+   A simple address the container system can ping to ask "are you alive,
+   and is your model ready?" It answers:
+     {"status": "ok", "model_loaded": true}
+   This is what lets the system know it's safe to start sending real
+   traffic. (The old "/healthz" name still works too.)
+
+------------------------------------------------------------------
+PART B - Observability ("we need to see what it's doing")
+------------------------------------------------------------------
+
+Every time the service analyses a clip, it now writes ONE tidy line to
+its log - formatted as JSON, so tools can search and chart it easily.
+
+Each line records:
+  - contact_id  (a random ID for that one request)
+  - audio_quality  (good / degraded / insufficient)
+  - the predicted gender and age bracket
+  - how many milliseconds it took
+  - the outcome: "ok", "degraded", or "error_fallback"
+
+The log line's loudness matches the situation:
+  - INFO     = normal, healthy request
+  - WARNING  = the audio was poor, or a clip was skipped / timed out
+  - ERROR    = something unexpected went wrong and we fell back to
+               "I don't know"
+
+Privacy: the logs NEVER contain the actual audio, the uploaded file's
+name, or anything else about the caller. The only identifier is the
+random contact_id we generate ourselves. (We wrote a test that
+specifically checks a nosy filename like "caller-jane-doe-ssn-123.wav"
+never leaks into the logs.)
+
+------------------------------------------------------------------
+PART C - Dockerize ("put it in a shipping crate")
+------------------------------------------------------------------
+
+A "container" is a sealed box that holds the app plus everything it
+needs, so it runs identically on any machine.
+
+The Dockerfile (the recipe for that box):
+  - Starts from a small standard Python base.
+  - Installs ffmpeg - the audio-conversion tool. It's a system program,
+    not something pip can install, so we install it separately.
+  - Installs the Python packages from requirements.txt.
+  - Copies in our app code.
+  - Downloads the 1.3 GB AI model *while the box is being built* and
+    bakes it in.
+      Why: the box then starts up instantly and works even with no
+      internet. The trade-off is a bigger box and a slower one-time
+      build. The alternative - downloading the model the first time it
+      runs - makes that first phone call wait several seconds and fails
+      completely if the machine has no internet. We chose reliability.
+      (This reasoning is written in a comment in the file.)
+  - Opens port 8000 and starts the web server.
+
+docker-compose.yml (the one-command way to run it):
+  - Builds the box from the Dockerfile.
+  - Connects port 8000 so you can reach it.
+  - Attaches a persistent storage area for the model, so restarting the
+    container doesn't re-download 1.3 GB every time.
+  - Adds a health check that pings "/health" - the container only counts
+    as "healthy" once the model has finished loading.
+
+Supporting files: a small startup script (docker-entrypoint.sh) that
+copies the baked-in model into the persistent storage on first run, and
+a .dockerignore file so junk (the local Python environment, the git
+history) doesn't get packed into the box.
+
+------------------------------------------------------------------
+PART D - How to test the whole thing from scratch
+------------------------------------------------------------------
+
+The exact commands are in the chat / README, but the shape of it:
+  1. Wipe everything (old box, old container, saved model).
+  2. Rebuild the box from zero with no shortcuts.
+  3. Start it and wait for it to report "healthy".
+  4. Check the startup logs say the model loaded exactly once.
+  5. Hit "/health" - expect model_loaded: true.
+  6. Upload sample.wav to "/analyze" - expect the same answer the
+     laptop version gives.
+  7. Upload a corrupt file - expect a polite "insufficient / unknown",
+     NOT an error.
+  8. Check the log line is clean JSON with no filename in it.
+  9. Open the Swagger page (http://localhost:8000/docs) and try it
+     there too.
+ 10. Restart the container - confirm it does NOT re-download the model.
+
+------------------------------------------------------------------
+Files added / changed in Phase 5
+------------------------------------------------------------------
+  NEW  app/logging_config.py     - the JSON log formatter
+  NEW  docker-entrypoint.sh      - seeds the model cache on first run
+  NEW  .dockerignore             - keeps the container image lean
+  NEW  tests/test_reliability.py - tests for /health, the timeout,
+                                   the crash-safety net, and no-PII logs
+  EDIT app/api/routes.py         - timeout guard, /health, log levels
+  EDIT app/main.py               - turn on JSON logging at startup
+  EDIT app/inference/model.py    - configurable cache dir + build hook
+  EDIT Dockerfile                - ffmpeg, bake the model, entrypoint
+  EDIT docker-compose.yml        - volume for the model, healthcheck
+  EDIT README.md                 - documented all of the above
+
+Result: the service is now submission-ready - hard to break, easy to
+observe, and runs the same in a container as on a laptop.
+
+Commands:
+  docker compose build --no-cache
+  docker compose up -d
+  curl -s http://localhost:8000/health
+  curl -s -X POST http://localhost:8000/analyze -F "audio=@sample.wav;type=audio/wav"
+  pytest tests/ -v

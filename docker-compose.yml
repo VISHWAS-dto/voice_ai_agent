@@ -1,19 +1,39 @@
 services:
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: voice-attr-inference:latest
     ports:
       - "8000:8000"
     environment:
-      HF_HOME: /models/hf
-      TORCH_HOME: /models/torch
+      LOG_LEVEL: INFO
+      # Must match the Dockerfile; the volume below is mounted here so the
+      # HF weights persist across `docker compose down` / `up` without a
+      # re-download. On the volume's first use it is empty and the
+      # entrypoint seeds it from the image-baked copy.
+      MODEL_CACHE_DIR: /app/.model_cache
     volumes:
-      - ./:/app
-      - model-cache:/models
-    command: >
-      uvicorn app.main:app
-      --host 0.0.0.0
-      --port 8000
-      --reload
+      - model-cache:/app/.model_cache
+    healthcheck:
+      # Container is "healthy" only once the model has finished loading.
+      # Uses the stdlib (no curl in the slim image).
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import sys, urllib.request, json;
+          r = json.load(urllib.request.urlopen("http://localhost:8000/health", timeout=5));
+          sys.exit(0 if r.get("status") == "ok" and r.get("model_loaded") else 1)
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      # Generous grace period: a cold start that has to seed the cache from
+      # the baked copy (a ~1.3 GB local copy) then load ~1.3 GB of weights
+      # can take a while before /health reports model_loaded: true.
+      start_period: 120s
+    restart: unless-stopped
 
 volumes:
   model-cache:
