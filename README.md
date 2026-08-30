@@ -193,8 +193,65 @@ for the same check.
 
 ### `WS /ws/analyze`
 
-Declared but **not implemented** — it raises `NotImplementedError`. See
-[§8](#8-bonus-tasks).
+A **bonus** streaming endpoint for progressive predictions as audio arrives
+(`app/api/websocket.py`). It is a thin orchestration layer over the exact
+same pipeline as `POST /analyze` — it does not re-implement decode / VAD /
+quality / inference.
+
+**Protocol:**
+
+1. Client connects and sends **binary** messages: raw **16 kHz mono
+   little-endian float32 PCM** (the canonical format `normalize_audio()`
+   emits), any chunk size — chunks need not align to a window.
+2. The server appends bytes to an in-memory rolling buffer. Every time
+   **2 s** of audio has accumulated it detaches that window and runs
+   `normalize_audio → run_vad → assess_quality → (skip if "insufficient")
+   → AttributeInferencer.predict()`, then sends one **text** message: an
+   `/analyze`-shaped JSON body plus two extra fields —
+   - `window_index` (0-based) so the client can watch predictions evolve,
+   - `best_so_far`, the running best (see below).
+3. The client ends the stream by closing the socket, or by sending the
+   text frame `"close"`. The server flushes any remaining partial buffer
+   as one last window, sends `{"event": "closing", "reason": ...,
+   "windows_processed": N, "best_so_far": {...}}`, and closes.
+
+**Running "best" strategy:** the window with the **highest gender
+confidence seen so far** wins (a plain argmax over windows), age carried
+from that same window. Chosen over confidence-averaging because averaging
+only makes sense while the same class keeps winning, so it needs per-class
+bookkeeping and a policy for when the winning class flips mid-call — more
+moving parts, more to get subtly wrong. Windows graded `insufficient`
+(model skipped, confidence `0.0`) never displace a real prediction. See
+the `_StreamSession.observe` docstring.
+
+**Reliability & privacy (same rules as `/analyze`):**
+
+- Each window runs in a worker thread under a 3 s budget; on overrun or a
+  decode failure that window's message is all-`unknown` / `insufficient`
+  rather than stalling or dropping the stream.
+- A client disconnect is caught and turns into clean buffer cleanup — no
+  crash, no traceback, one structured log line.
+- **Nothing is ever written to disk.** Chunks live in an in-memory
+  `bytearray` and are decoded by streaming into ffmpeg over a pipe.
+- **No raw audio or raw bytes are logged** — one structured line per
+  window with only `contact_id`, byte/sample *counts*, timing, the
+  quality grade, and prediction *labels*.
+- **Resource guards** so a client cannot hold the socket open or exhaust
+  memory: max session duration (120 s), max cumulative received bytes,
+  max window count (60), and a 30 s idle-receive timeout. Tripping any of
+  them sends `{"event": "closing", "reason": ...}` and closes with code
+  1008.
+
+**Test client:** `scripts/test_websocket.py` decodes `sample.wav` once
+(in memory, via `normalize_audio`), streams it in ~0.5 s chunks with a
+short delay between sends to mimic real-time arrival, prints each incoming
+prediction, and closes cleanly on EOF.
+
+```bash
+# with the service running (uvicorn app.main:app):
+python scripts/test_websocket.py
+python scripts/test_websocket.py --file path/to/other.wav
+```
 
 ## 4. Architecture / design decisions
 
@@ -465,5 +522,5 @@ calls/second. To reach ~1000 concurrent calls (elaborated in the video):
 | Structured JSON logging / observability | ✅ done | One line per request, PII-safe, level reflects outcome. `app/logging_config.py`.        |
 | Reliability hardening                  | ✅ done | Never-500 safety net + 3 s timeout guard, both tested (`tests/test_reliability.py`).     |
 | Offline eval harness                   | ⚠️ partial | `eval/run_eval.py` is complete and honest (accuracy + abstain rate + calibration table), but the labeled dataset is a stub of N = 1. Mozilla Common Voice — the natural source — is now a gated HF dataset (account + token + licence + multi-GB download), so it was deliberately kept out of the zero-setup path; `--help` prints the ~15 lines to wire it in. |
-| Streaming inference (`WS /ws/analyze`) | ❌ skipped | Endpoint is stubbed (`raise NotImplementedError`) with the planned protocol in its docstring. Skipped for time — a correct incremental VAD + partial-result implementation is a meaningful chunk of work, and the batch `POST /analyze` path covers the core requirement. |
+| Streaming inference (`WS /ws/analyze`) | ✅ done | `app/api/websocket.py`. Client streams raw 16 kHz mono float32 PCM chunks; the server buffers them into non-overlapping 2 s windows and runs each through the **same** `normalize_audio → run_vad → assess_quality → predict()` pipeline as `/analyze` (thin orchestration, no duplicated logic). Emits an `/analyze`-shaped JSON message per window plus `window_index` and a running `best_so_far` (highest-gender-confidence-wins — see the `observe()` comment for why not averaging). Per-window worker-thread timeout, graceful client-disconnect handling, in-memory only (nothing to disk, no bytes logged), and session-duration / total-bytes / window-count guards so a client can't hold the socket open or exhaust memory. Test client: `scripts/test_websocket.py` streams `sample.wav` in ~0.5 s chunks in real time. See [§3](#ws-wsanalyze). |
 | Quality-threshold calibration          | ❌ skipped | Needs a set of clips human-labeled `good`/`degraded`/`insufficient`, which does not exist yet. Thresholds are a documented starting point; boundaries are pinned by tests so a retune is deliberate. |
