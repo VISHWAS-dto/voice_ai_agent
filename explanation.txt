@@ -1,0 +1,894 @@
+===============================================================================
+ VOICE AI AGENTS - PROJECT EXPLANATION (for a complete beginner)
+===============================================================================
+
+Read this top to bottom. It explains, in plain language:
+  PART 1 - What this project actually does (the big idea)
+  PART 2 - The architecture, explained like you've never seen a web service
+  PART 3 - Every single file, one by one, and what its job is
+  PART 4 - What happens step-by-step when a request comes in
+  PART 5 - The important trade-offs and "why did they do it that way"
+  PART 6 - Known limitations (things that are NOT finished / NOT proven)
+
+
+===============================================================================
+ PART 1 - THE BIG IDEA
+===============================================================================
+
+Imagine a logistics company (parcels, trucks, shipments). Customers phone in
+to ask "where is my package?". The company has a ROBOT that answers the phone
+and talks to the customer (a "voice AI agent").
+
+This project is a small HELPER for that robot. It does ONE tiny job:
+
+    You give it a short recording of the caller's voice.
+    It listens and gives back a rough guess of:
+        - the caller's GENDER      (male / female / "unknown")
+        - the caller's AGE BRACKET (18-30 / 31-45 / 46-60 / 60+ / "unknown")
+        - a QUALITY RATING of the recording (good / degraded / insufficient)
+        - how many milliseconds it took
+
+Why would the robot want this? So it can adjust how it talks. For example:
+speak slower and more formally to an older caller; skip "use our app instead"
+prompts for someone unlikely to use an app.
+
+VERY IMPORTANT framing (the authors repeat this everywhere):
+  - It is a SOFT HINT, not a fact. The guesses are noisy and often wrong.
+  - It is NOT identity verification. It must never be used to prove who
+    someone is.
+  - If anything goes wrong inside this helper, it must NOT break the phone
+    call. It always answers politely with "unknown" instead of crashing.
+
+The whole thing is a small web service (an HTTP API) written in Python.
+
+
+===============================================================================
+ PART 2 - THE ARCHITECTURE, EXPLAINED SIMPLY
+===============================================================================
+
+2.1  WHAT IS "A SERVICE" / "AN API"?
+-----------------------------------
+A "service" here is just a program that runs forever, waiting. Other programs
+(like the phone robot) send it a message over the network ("here is some
+audio, analyse it") and it sends a message back ("here is my guess"). That
+request/response style over the web is called an HTTP API.
+
+The tool used to build it is called FastAPI (a popular Python library for
+making web APIs). The program that actually runs FastAPI and listens on the
+network is called uvicorn (a "web server").
+
+2.2  THE THREE "DOORS" INTO THE SERVICE (the endpoints)
+-------------------------------------------------------
+  POST /analyze
+      The main door. You send an audio file, you get back the JSON guess
+      (gender, age, quality, timing). "POST" just means "I'm sending you
+      data". Always replies with HTTP 200 ("OK") - even on errors (see 2.6).
+
+  GET /health   (and its old alias GET /healthz)
+      A "are you alive?" door. Returns {"status":"ok","model_loaded":true}.
+      The container system pings this to know when it's safe to send real
+      traffic. "model_loaded" is only true AFTER the big AI model has
+      finished loading into memory.
+
+  WS /ws/analyze
+      A BONUS "streaming" door. Instead of one file, the caller sends audio
+      in a continuous trickle while still talking, and gets a fresh guess
+      every 2 seconds so the prediction can improve as more voice arrives.
+      ("WS" = WebSocket, a kind of long-lived two-way connection.)
+
+2.3  THE PIPELINE (the assembly line inside /analyze)
+----------------------------------------------------
+When audio comes in, it goes down an assembly line. Each station does one
+thing and hands the result to the next:
+
+  [1] RECEIVE
+      Read the uploaded bytes into memory. Never save to a file on disk
+      (call recordings can contain private info - PII).
+
+  [2] NORMALIZE  (app/audio/ingest.py -> normalize_audio)
+      Audio can arrive in many formats (mp3, wav, m4a, phone formats...).
+      This station shells out to a program called "ffmpeg" to convert
+      ANY of them into ONE standard shape the AI model understands:
+      16,000 samples per second, mono (one channel), numbers between -1 and 1.
+      The conversion is done by "piping" bytes into ffmpeg and reading the
+      result back - still nothing touches the disk.
+
+  [3] VAD - Voice Activity Detection  (ingest.py -> run_vad)
+      "Is there actually a person talking here, or is it silence / hold
+      music / line noise?" Uses a tiny library called webrtcvad. It chops
+      the audio into 30-millisecond frames and labels each frame
+      speech / not-speech, then reports:
+          total length, how many seconds were speech,
+          the "speech ratio" (speech seconds / total seconds), and
+          how many separate bursts of speech there were.
+
+  [4] QUALITY GATE  (app/audio/quality.py -> assess_quality)
+      Turns the VAD numbers into a verdict:
+          speech ratio >= 0.5 ................... "good"
+          speech ratio 0.15 - 0.5 .............. "degraded"
+          speech ratio < 0.15, OR < 0.5s of
+             speech, OR clip shorter than 0.5s .. "insufficient"
+
+  [5a] SHORT-CIRCUIT if "insufficient"
+      If the clip is basically silence, DON'T run the AI model at all.
+      Just return gender=unknown, age=unknown, confidence 0.0. Two reasons:
+      it saves computing power, and (more importantly) running the model on
+      silence gives a CONFIDENT-LOOKING wrong answer, which is worse than an
+      honest "I don't know".
+
+  [5b] RUN THE MODEL  (app/inference/model.py -> AttributeInferencer.predict)
+      Otherwise, feed the clean waveform through the AI model (one forward
+      pass) and get raw numbers back, then translate them into the friendly
+      labels (see PART 5 for how age numbers become brackets).
+
+  [6] BUILD THE RESPONSE
+      Assemble the JSON: contact_id, gender {prediction, confidence},
+      age_bracket {prediction, confidence}, processing_ms, audio_quality.
+      Write ONE log line. Return HTTP 200.
+
+2.4  THE AI MODEL
+-----------------
+The "model" is a pre-trained neural network downloaded from Hugging Face
+(a website that hosts AI models). Its name is:
+
+    audeering/wav2vec2-large-robust-24-ft-age-gender
+
+It is about 1.2-1.3 GB of "weights" (the learned numbers). It was trained
+by other people to look at a voice and output an age number and a
+gender guess. The authors picked THIS model because it was trained partly
+on messy TELEPHONE audio, so it should cope better with call-center sound
+(8kHz, line noise, background trucks) than a model trained on clean studio
+speech.
+
+The model is loaded ONCE when the service starts up (takes ~6 seconds), and
+then REUSED for every request. Loading it per-request would add a multi-
+second delay to every phone call. After warm-up, a normal request takes
+~200-300 milliseconds.
+
+2.5  MEMORY-ONLY / PRIVACY
+-------------------------
+Call recordings often contain personal data and legal recording-consent
+limits. So the design rule is: the audio lives ONLY in the program's memory,
+for ONLY as long as the request needs it.
+  - Never written to a file. No temp files.
+  - ffmpeg gets the bytes through a pipe, not a file path.
+  - The logs NEVER contain the audio, the uploaded filename, or a transcript.
+    The only ID in the logs is a random "contact_id" the service makes up
+    itself. There's even a test that uploads a file called
+    "caller-jane-doe-ssn-123.wav" and checks none of that text leaks into
+    the log line.
+
+2.6  RELIABILITY (the "seatbelts")
+---------------------------------
+Because this must never break the phone call:
+  - NEVER returns an error status. The whole handler is wrapped in a big
+    "try / except". If literally anything unexpected breaks, it logs the
+    error and STILL returns a normal HTTP 200 with all-"unknown" fields.
+  - NEVER hangs. The decode+VAD+model work runs in a background worker
+    thread with a hard 3-second stopwatch. If it overruns, the request
+    immediately returns the safe "unknown" answer; the slow work finishes
+    on its own and its result is thrown away.
+  - The log line's severity matches reality: INFO for a clean "good" read,
+    WARNING for degraded/insufficient/timeout, ERROR for the crash-fallback.
+
+2.7  LOGGING / OBSERVABILITY
+--------------------------
+Every request writes exactly ONE line of JSON to stdout (the terminal /
+container output). JSON so that log tools (Datadog, Loki, CloudWatch...)
+can search and chart it. Fields: contact_id, audio_quality,
+gender_prediction, age_prediction, processing_ms, inference_ms, outcome.
+
+2.8  DOCKER (the "shipping crate")
+--------------------------------
+Docker packages the app + Python + ffmpeg + the 1.3GB model into one sealed
+"image" so it runs identically on any machine. The model weights are
+downloaded and baked IN during the image build, so the first container
+start needs no internet and is fast. A "named volume" keeps the model
+cache between restarts so it isn't re-downloaded.
+
+2.9  THE DIRECTORY LAYOUT
+-----------------------
+  app/                  <- the actual service code
+    main.py             <- starts everything, loads the model once
+    logging_config.py   <- the JSON log formatter
+    api/
+      routes.py         <- POST /analyze and GET /health
+      websocket.py      <- WS /ws/analyze (the streaming bonus)
+    audio/
+      ingest.py         <- decode + normalize + VAD
+      quality.py        <- good / degraded / insufficient decision
+    inference/
+      model.py          <- the AI model wrapper (predict())
+    schemas/
+      models.py         <- the exact shape of the JSON response
+  tests/                <- automated tests (pytest)
+  scripts/              <- manual "try it by hand" helper scripts
+  eval/                 <- "report card" harness: how accurate is the model?
+  Dockerfile, docker-compose.yml, docker-entrypoint.sh, .dockerignore
+  requirements.txt      <- list of Python libraries needed
+  README.md             <- the full official documentation
+  Summary.txt           <- the authors' phase-by-phase build diary
+  sample.wav            <- one bundled test clip (a ~3s TIMIT sentence)
+
+
+===============================================================================
+ PART 3 - EVERY FILE, ONE BY ONE
+===============================================================================
+
+-------------------------------------------------------------------------------
+ app/ - THE SERVICE CODE
+-------------------------------------------------------------------------------
+
+app/__init__.py
+app/api/__init__.py
+app/audio/__init__.py
+app/inference/__init__.py
+app/schemas/__init__.py
+tests/__init__.py
+    EMPTY files. In Python, an empty "__init__.py" just tells Python
+    "this folder is a package you can import from". No logic. Ignore them.
+
+app/main.py
+    The STARTING POINT of the whole service. When you run
+    "uvicorn app.main:app", this file is loaded.
+    What it does:
+      - Turns on JSON logging (before anything else, so even startup lines
+        are JSON).
+      - Defines a "lifespan" function: code that runs ONCE at startup and
+        ONCE at shutdown.
+          * On startup: create the AttributeInferencer (this loads the
+            1.3 GB model). Store it on "app.state.inferencer" so every
+            request can reuse the same one.
+          * On shutdown: drop the reference so memory is freed.
+      - Builds the FastAPI "app" object and plugs in the two routers
+        (routes.py for HTTP, websocket.py for the WS endpoint).
+    Key idea: the model is loaded exactly once here, never per-request.
+
+app/logging_config.py
+    Defines HOW log lines look. Contains:
+      - JsonFormatter: takes an internal log record and renders it as a
+        single line of JSON with fields like ts, level, logger, message.
+        It also "promotes" a fixed allow-list of extra fields (contact_id,
+        audio_quality, gender_prediction, age_prediction, processing_ms,
+        outcome, ...) to the top level so they're easy to query. ANYTHING
+        NOT on that allow-list is silently dropped - this is a privacy
+        safety net: even if someone accidentally tried to log the filename,
+        it wouldn't come through.
+      - configure_logging(): installs that formatter on Python's root
+        logger, removes uvicorn's default plain-text handlers so lines
+        aren't printed twice. Safe to call more than once.
+
+app/api/routes.py
+    The HTTP endpoints. This is the heart of the service.
+      - POST /analyze:
+          Runs the whole pipeline described in PART 2.3. Key details:
+            * Reads the upload into memory (never disk).
+            * Mints a fresh random contact_id (uuid4) per request. Even if
+              the caller sends their own contact_id in the form, it is
+              IGNORED - so a caller can't inject a value into your logs.
+            * Runs the blocking work (_run_pipeline) in a worker thread
+              under a 3-second timeout (_PROCESSING_BUDGET_S). On timeout:
+              return safe "unknown" body, log a WARNING.
+            * On a decode failure (corrupt/empty/unknown audio): return
+              "insufficient" + unknown, NOT an error. Log a WARNING.
+            * If quality == "insufficient": skip the model entirely.
+            * processing_ms measures the WHOLE thing (read + decode + VAD +
+              quality + model), not just the model.
+            * The whole handler is wrapped in a broad try/except: ANY
+              unexpected error -> log at ERROR with outcome
+              "error_fallback", still return HTTP 200 with unknowns. Never
+              a 500.
+            * Emits exactly one structured log line per request.
+      - GET /health: returns {"status":"ok","model_loaded": <bool>}.
+        model_loaded is true only once the model is actually resident.
+      - GET /healthz: identical alias, kept for old probe configs.
+      - _run_pipeline(): the pure "decode -> VAD -> quality -> model" core,
+        split out so it can run in the timed worker thread.
+      - _unknown_response(): builds the all-"unknown" response object used
+        for skips, decode errors, timeouts and crashes.
+
+app/api/websocket.py
+    The BONUS streaming endpoint WS /ws/analyze. It's a "thin orchestration
+    layer" - it does NOT re-implement decode/VAD/quality/model, it calls
+    the exact same functions as /analyze.
+    How it works:
+      - Client connects and sends BINARY chunks of raw 16 kHz mono
+        float32 PCM audio (any chunk size).
+      - The server appends bytes to an in-memory rolling buffer
+        (_StreamSession). Every time 2 seconds (_WINDOW_S) of audio has
+        piled up, it detaches that 2s "window" and runs it through
+        normalize_audio -> run_vad -> assess_quality -> (skip if
+        insufficient) -> predict().
+      - After each window it sends back one TEXT message: an /analyze-shaped
+        JSON body PLUS two extra fields:
+            window_index  - which 2s slice this was (0, 1, 2, ...)
+            best_so_far   - the running "best" guess across all windows so
+                            far. Strategy: the window with the HIGHEST
+                            gender confidence wins (a simple max), age
+                            carried from that same window. Windows graded
+                            "insufficient" never replace a real guess.
+            (Why "max" and not "average"? Averaging needs bookkeeping for
+             when the winning class flips mid-call; "keep the most confident
+             window" is one comparison and obviously correct.)
+      - Client ends by closing the socket or sending the text "close". The
+        server flushes any leftover partial buffer as one last window,
+        sends {"event":"closing", ...}, and closes.
+      - Same reliability rules: each window runs in a worker thread under a
+        3s budget; a bad window becomes an all-"unknown" message instead of
+        killing the stream. A client disconnect is caught cleanly (no
+        crash, one log line).
+      - Resource guards so a client can't abuse it: max session 120s
+        (_MAX_SESSION_S), max 60 windows (_MAX_WINDOWS), a cap on total
+        bytes received (_MAX_TOTAL_BYTES), and a 30s idle-receive timeout
+        (_RECV_TIMEOUT_S). Tripping any of them sends a "closing" message
+        and closes with code 1008.
+      - In-memory only, no bytes ever logged (same privacy rules).
+
+app/audio/ingest.py
+    "Get the audio in and clean it up." Pure, testable functions - no web
+    code, no global state. Contains:
+      - normalize_audio(raw_bytes, input_format=None):
+          Runs ffmpeg (found on PATH) as a subprocess, feeding raw_bytes in
+          over stdin ("pipe:0") and reading back raw 16 kHz mono
+          little-endian float32 PCM over stdout ("pipe:1"). No temp file.
+          Handles wav/mp3/m4a/ogg/opus/webm automatically; for headerless
+          telephony formats you pass input_format="mulaw"/"alaw" (it then
+          also tells ffmpeg the stream is 8kHz mono, the G.711 norm).
+          Clips out-of-range samples to [-1, 1] (doesn't rescale, so
+          loudness is preserved).
+          Raises AudioDecodeError if: bytes are empty, ffmpeg binary
+          missing, ffmpeg exits non-zero (corrupt/unknown input), or ffmpeg
+          produced zero samples. The error message carries the tail of
+          ffmpeg's stderr so logs are actionable.
+      - run_vad(waveform, sample_rate=16000):
+          Runs webrtcvad frame-by-frame (30 ms frames, aggressiveness 2)
+          and returns a dict:
+            total_duration_s, speech_duration_s, speech_ratio (0..1,
+            clamped), num_speech_segments (count of speech bursts).
+          Clips shorter than one 30 ms frame, or pure silence, return
+          speech_ratio 0.0 instead of crashing. Only accepts 8/16/32/48 kHz
+          (webrtcvad's limitation) - anything else raises ValueError.
+          NOTE on the choice: webrtcvad was picked over "silero-vad"
+          because it's tiny, needs no model download, no torch, and is
+          fast + predictable. It's only a rough "is there enough speech
+          here?" gate, so that's fine.
+      - decode_to_canonical(): convenience wrapper that returns a
+        DecodedAudio dataclass (samples + sample_rate + duration_s) so
+        callers don't recompute duration.
+      - DecodedAudio: a small dataclass (just a typed container).
+      - _float_to_pcm16(), _tail(): small internal helpers (float->int16
+        conversion for webrtcvad; trimming ffmpeg stderr for messages).
+
+app/audio/quality.py
+    ONE job: assess_quality(vad_stats) -> "good" | "degraded" |
+    "insufficient". It reads three numbers off the VAD dict (speech_ratio,
+    speech_duration_s, total_duration_s) and applies the thresholds:
+        ratio < 0.15  OR  speech < 0.5s  OR  clip < 0.5s  -> "insufficient"
+        0.15 <= ratio < 0.5                               -> "degraded"
+        ratio >= 0.5                                      -> "good"
+    Deliberately gates on SPEECH RATIO ONLY - not loudness, not
+    signal-to-noise, not clipping. Reason: the chosen model tolerates noise
+    well but NOT near-silence (silence makes it produce confident nonsense).
+    Missing/None keys are treated as 0.0 so a broken input degrades to
+    "insufficient" rather than crashing.
+    The threshold numbers (0.15, 0.5) are an admitted HAND-PICKED starting
+    point, not tuned against human-labeled clips. The unit tests pin the
+    exact edges so any future retune is a deliberate, visible change.
+
+app/inference/model.py
+    The AI model wrapper. Contains:
+      - MODEL_NAME, CACHE_DIR, and the bracket / label constants.
+        CACHE_DIR defaults to <repo>/.model_cache but can be overridden with
+        the MODEL_CACHE_DIR environment variable (Docker sets it to a fixed
+        path backed by a volume).
+      - _ModelHead and _AgeGenderModel: the actual neural-network
+        architecture, COPIED VERBATIM from the model's "model card" (the
+        author's published definition), because this model uses a custom
+        architecture that isn't built into the transformers library, so
+        from_pretrained() needs a class to load the weights into. (One small
+        fix vs the model card: it calls the old self.init_weights(); on
+        transformers v5 you must call self.post_init() instead or loading
+        breaks. Same fix is in scripts/test_model_load.py.)
+        The model outputs: a pooled embedding, an AGE regression scalar in
+        ~[0,1] (years = value * 100), and a 3-way GENDER softmax over
+        (child, female, male).
+      - AttributeInferencer:
+          __init__(): loads the processor + model from the cache dir. If it
+            can't load (no network on a cold cache, corrupt cache, out of
+            disk/RAM) it raises RuntimeError immediately - "fail fast at
+            startup, not per request". Runs on CPU.
+          predict(waveform, sample_rate=16000) -> dict with:
+            gender_prediction : "male" | "female" | "unknown"
+            gender_confidence : 0..1 (the softmax probability of the
+                                reported class; this IS a real classifier
+                                probability). 0.0 when "unknown".
+            age_bracket       : "18-30" | "31-45" | "46-60" | "60+" |
+                                "unknown"
+            age_confidence    : 0..1 but really only ~0.30..0.65. This is
+                                NOT a real probability - the age head is a
+                                regression with no distribution behind it.
+                                It's a deliberately modest "interiority"
+                                heuristic: how far the predicted year sits
+                                from the nearest edge of its bracket. ~0.30
+                                on an edge, ~0.65 dead-centre, never near
+                                1.0. Reason: silence/noise regress toward a
+                                mid-bracket year, and without this cap that
+                                would look like high confidence.
+            inference_ms      : time spent in the model forward pass ONLY
+                                (feature extraction before + bracket mapping
+                                after are excluded, so it's comparable
+                                across clips).
+          The whole forward pass is wrapped in try/except: on ANY failure
+          (bad shape, NaNs, OOM, internal error) it returns all-"unknown" /
+          0.0 rather than raising. Empty waveform -> also all-"unknown"
+          without bothering the model.
+      - _map_gender(probs): child-dominant (or malformed) -> "unknown"/0.0;
+        male/female -> that label + its probability. The API has no "child"
+        value and the child probability isn't a male/female confidence, so
+        it's folded to "unknown".
+      - _map_age(value): value*100 = years. years < 18 -> "unknown" (the
+        product only scores adult callers; sub-18 usually means a childlike
+        or out-of-distribution voice, or too-degraded audio). Otherwise
+        bucket by year using the brackets' own edges; the boundary year
+        falls in the LOWER bracket (30 -> "18-30", matching how people say
+        "early thirties starts at 31"). Also computes the interiority
+        confidence.
+      - if __name__ == "__main__": lets you run "python -m
+        app.inference.model" to pre-download the weights - this is what the
+        Dockerfile calls at build time so a broken model fails the image
+        build, not the first container start.
+
+app/schemas/models.py
+    The API CONTRACT - the exact shape of the JSON, defined with Pydantic
+    (a library that validates data shapes). This was the very first real
+    file written; everything else was built to fit it.
+      - GenderPrediction enum: "male" | "female" | "unknown"
+      - AgeBracketPrediction enum: "18-30" | "31-45" | "46-60" | "60+" |
+        "unknown"
+      - AudioQuality enum: "good" | "degraded" | "insufficient"
+      - GenderResult: { prediction, confidence (float 0..1) }
+      - AgeBracketResult: { prediction, confidence (float 0..1) }
+      - AnalyzeResponse: { contact_id (uuid), gender, age_bracket,
+        processing_ms (int >= 0), audio_quality }
+    Pydantic enforces these ranges/values automatically, so a bug that
+    produced, say, confidence 1.5 would be caught here.
+
+-------------------------------------------------------------------------------
+ tests/ - AUTOMATED TESTS (run with: pytest -q)
+-------------------------------------------------------------------------------
+
+tests/test_quality.py
+    27 tiny unit tests for assess_quality(). They build the VAD-stats dict
+    by hand (the real VAD is not run) and check every rule AND every exact
+    boundary (exactly 0.15, exactly 0.5, exactly 0.5 seconds). Also checks
+    it doesn't crash on an empty dict or None values. Pure and fast - needs
+    no model, no ffmpeg. The point of pinning the boundaries: if someone
+    later changes a threshold, a test lights up so it's a deliberate change.
+
+tests/test_analyze.py
+    Integration tests for POST /analyze and GET /health. These boot the
+    REAL FastAPI app through FastAPI's TestClient, which runs the startup
+    lifespan and loads the REAL model once for the module (NOT mocked).
+    They need ffmpeg on PATH and the weights already cached.
+    Checks:
+      - Upload sample.wav -> HTTP 200 with a fully valid response shape:
+        valid uuid4 contact_id, gender in {male,female,unknown}, age in the
+        4 brackets or unknown, confidences are real floats in [0,1],
+        processing_ms present. (It checks the SHAPE, not specific
+        predictions - which gender the model guesses for this clip isn't
+        part of the contract and would make the test brittle.)
+      - Every request gets its OWN fresh contact_id, even if the caller
+        sends one.
+      - Upload a corrupt file -> HTTP 200 (NOT 500), quality
+        "insufficient", gender/age "unknown", confidences 0.0.
+      - Upload an empty file -> same graceful handling.
+      - GET /health -> 200 with model_loaded true.
+    Note: the upload form field is named "audio".
+
+tests/test_reliability.py
+    The Phase-5 "seatbelt" tests:
+      - /health is 200 + model_loaded true inside the lifespan; and 200 +
+        model_loaded false if the lifespan didn't run.
+      - /healthz alias matches /health.
+      - TIMEOUT guard: it monkey-patches _run_pipeline to sleep 5s and
+        _PROCESSING_BUDGET_S down to 0.5s, then checks the request still
+        returns a valid all-"unknown"/insufficient 200 (doesn't hang) and
+        logs a WARNING with timed_out + outcome "degraded".
+      - EXCEPTION fallback: monkey-patches _run_pipeline to raise
+        RuntimeError, checks the response is still 200 all-"unknown" and
+        it's logged at ERROR with outcome "error_fallback" and
+        error_type "RuntimeError".
+      - PII: uploads a file named "caller-jane-doe-ssn-123.wav" and asserts
+        exactly ONE log line is emitted and that none of "caller-jane",
+        "jane-doe", "ssn", ".wav", or "filename" appears anywhere in it.
+
+tests/test_schemas.py
+    A STUB. One test, marked @pytest.mark.skip ("schema tests not written
+    yet"). Left untouched on purpose. This is the "1 skipped" in the suite
+    result "38 passed, 1 skipped".
+
+-------------------------------------------------------------------------------
+ scripts/ - MANUAL "TRY IT BY HAND" SCRIPTS (not part of the test suite)
+-------------------------------------------------------------------------------
+These are for a developer to eyeball behaviour during development. Each
+prints human-readable output and exits non-zero on failure.
+
+scripts/test_model_load.py
+    The earliest script. Standalone (does NOT import the app package).
+    Loads the raw model, runs ONE forward pass on a WAV you pass in, and
+    dumps the RAW model outputs (age scalar, gender softmax, embedding
+    shape) so you can see exactly what the model returns before writing any
+    mapping logic. This is where the (child, female, male) label order and
+    the years = value*100 convention were confirmed.
+        python scripts/test_model_load.py sample.wav
+
+scripts/test_ingest.py
+    Manual smoke test for app/audio/ingest.py. Runs a real WAV through
+    normalize_audio -> run_vad and prints the stats, then checks the
+    graceful paths: a synthetic silent WAV (expect speech_ratio 0.0), a
+    very short (0.1s) buffer (expect 0.0, no crash), an empty buffer
+    (expect AudioDecodeError), and a garbage buffer (expect
+    AudioDecodeError).
+        python scripts/test_ingest.py sample.wav
+
+scripts/test_inference.py
+    Manual smoke test for app/inference/model.py. Loads AttributeInferencer
+    once, then: (1) runs predict() on a real WAV and prints the full result
+    dict + timing; (2) runs predict() on 3 seconds of synthetic silence and
+    confirms it does NOT crash and does NOT produce spuriously high
+    confidence (gender_confidence <= 0.7, age_confidence <= 0.66).
+        python scripts/test_inference.py sample.wav
+
+scripts/test_websocket.py
+    Manual test client for WS /ws/analyze. You run the service first, then
+    this script: it decodes sample.wav once (in memory, via normalize_audio),
+    streams it to the server in ~0.5s chunks with a ~0.4s delay between
+    sends to mimic a real-time call, prints each prediction message as it
+    arrives, then sends "close" and prints the final summary.
+        python scripts/test_websocket.py
+        python scripts/test_websocket.py --file path/to/other.wav
+
+-------------------------------------------------------------------------------
+ eval/ - THE "REPORT CARD" HARNESS (how accurate is the model, really?)
+-------------------------------------------------------------------------------
+
+eval/run_eval.py
+    An OFFLINE evaluation script. It loads AttributeInferencer DIRECTLY
+    (not through the web API - the goal is to measure the MODEL, not
+    FastAPI), runs every clip listed in a CSV manifest of labeled clips,
+    and prints a report:
+      - gender accuracy: % correct, counting ONLY clips where the model
+        actually committed to male/female. The "unknown" (abstain) rate is
+        reported SEPARATELY - an "I don't know" is neither right nor wrong.
+      - age-bracket accuracy: same idea, exact bracket match.
+      - a CALIBRATION table: it groups predictions by the confidence the
+        model reported (0.5-0.6, 0.6-0.7, ...) and shows the ACTUAL hit-rate
+        in each group. If the model says "0.9 confident" a lot but is only
+        right 60% of the time, its confidence number is untrustworthy and
+        this table is where you'd see it.
+      - results are also broken out for "verified-label clips only" so a
+        pile of guessed labels can't quietly inflate the headline number.
+      - one bad/missing/corrupt clip is logged and skipped - it never
+        aborts the run.
+      - --json dumps the raw per-clip results to a file.
+      - --help prints a ~15-line how-to for wiring in Mozilla Common Voice.
+    HONESTLY LABELLED as a stub: see limitations in PART 6.
+
+eval/datasets/manifest.csv
+    The list of labeled test clips, one row per clip:
+        path, gender, age_bracket, verified, notes
+    Lines starting with "#" are comments (and the file is mostly a big
+    honest comment about its own limitations). As shipped it has exactly
+    ONE real row:
+        sample.wav, male, 31-45, no, "LDC93S1 TIMIT SA1 sentence ..."
+    The "verified=no" means the label is a best-effort guess, not
+    independently confirmed. This CSV is checked into git; the audio it
+    points to generally is NOT (see .gitignore).
+
+eval/reports/run.json
+    An example output file from a past "--json" run. It records that on the
+    one bundled clip (a ~46-year-old male speaker) the model returned
+    gender="unknown" (its internal "child" class won) and age_bracket=
+    "18-30" - i.e. it got BOTH wrong. A concrete demonstration of the model
+    struggling on short, telephone-ish audio. (This folder is normally
+    git-ignored.)
+
+eval/README.md
+    Documents how to run the eval, the calibration idea, and - at length -
+    the honest limitations (tiny sample, no class balance, unverified
+    label, why Common Voice isn't wired in by default).
+
+-------------------------------------------------------------------------------
+ CONTAINER / PACKAGING FILES
+-------------------------------------------------------------------------------
+
+Dockerfile
+    The recipe to build the sealed "image":
+      1. Start from python:3.11-slim (small, but glibc so the prebuilt
+         torch/numpy/webrtcvad wheels install cleanly).
+      2. apt-get install ffmpeg (it's a system binary, pip can't provide
+         it; "ffmpeg-python" is only a thin wrapper and isn't even used
+         here - the code shells out to the real binary).
+      3. pip install -r requirements.txt (its own layer, so editing app
+         code doesn't bust the slow pip cache).
+      4. Copy in the app code.
+      5. RUN "python -m app.inference.model" to DOWNLOAD + BAKE the ~1.3 GB
+         of model weights INTO the image at build time, into a "seed" path.
+         Trade-off spelled out in a comment: baking = bigger image + slower
+         build, but the first container start needs NO internet and is fast
+         (good for offline / air-gapped / flaky networks). The alternative
+         (download on first start) makes the first request block for
+         seconds and fails with no internet.
+      6. Set HF_HUB_OFFLINE=1 / TRANSFORMERS_OFFLINE=1 so the running
+         container never phones home to huggingface.co.
+      7. Copy the rest (tests, README, sample.wav, eval/, entrypoint).
+      8. EXPOSE 8000, set the entrypoint script, and the default command:
+         "uvicorn app.main:app --host 0.0.0.0 --port 8000".
+      One worker only - the model is big and CPU-bound; you add replicas at
+      the orchestrator layer, not with --workers.
+
+docker-compose.yml
+    The one-command way to build + run it ("docker compose up -d"):
+      - Builds from the Dockerfile, names the image
+        voice-attr-inference:latest.
+      - Maps port 8000 on your machine to 8000 in the container.
+      - Mounts a NAMED VOLUME "model-cache" at /app/.model_cache so the
+        weights survive "docker compose down" / "up" without re-downloading.
+      - HEALTHCHECK: every 15s, run a tiny Python one-liner (no curl in the
+        slim image) that hits /health and exits 0 only if status is "ok"
+        AND model_loaded is true. start_period is a generous 120s because a
+        cold start has to seed + load ~1.3 GB. So the container only counts
+        as "healthy" once the model is actually ready.
+      - restart: unless-stopped.
+
+docker-entrypoint.sh
+    A tiny shell script that runs before uvicorn each time the container
+    starts. The problem it solves: the volume mounted at /app/.model_cache
+    starts EMPTY and shadows the model copy the image baked in. So this
+    script: if the runtime cache has no "models--*" snapshot yet, copy the
+    baked "seed" copy into it once; otherwise skip (warm restarts are
+    instant). Then "exec $@" hands off to the real command (uvicorn).
+
+.dockerignore
+    Keeps junk OUT of the build context (what gets sent to Docker): the
+    host's virtualenvs (myenv/, .venv/), the host's .model_cache/ (the
+    image bakes its own), .git/, __pycache__/, editor files, .env files,
+    eval/datasets/ and eval/reports/. Smaller context = faster, more
+    deterministic builds.
+
+.gitignore
+    Keeps junk OUT of git: __pycache__, virtualenvs (including myenv/ and
+    .venv/), test/coverage caches, ALL the model/weight caches (.model_cache/
+    etc. and *.pt/*.bin/*.safetensors), and the eval audio files - BUT it
+    explicitly KEEPS eval/datasets/manifest.csv and eval/datasets/README.md,
+    and keeps eval/reports/ out. Also .env files and editor/OS cruft.
+
+-------------------------------------------------------------------------------
+ TOP-LEVEL FILES
+-------------------------------------------------------------------------------
+
+requirements.txt
+    The Python libraries the project needs:
+      fastapi            - the web framework
+      uvicorn[standard]  - the web server that runs it (the [standard]
+                           extra pulls in the websockets library)
+      python-multipart   - lets FastAPI accept file uploads (multipart form
+                           data)
+      torch              - the deep-learning runtime the model runs on
+      torchaudio         - audio helpers for torch (used by
+                           scripts/test_model_load.py)
+      transformers       - Hugging Face library; provides the wav2vec2
+                           building blocks and from_pretrained()
+      webrtcvad          - the tiny voice-activity detector
+      numpy              - array math (the waveform is a numpy array)
+      ffmpeg-python      - a thin wrapper around ffmpeg (present in the list;
+                           the actual code shells out to the ffmpeg binary
+                           directly, and STILL needs the ffmpeg BINARY
+                           installed separately on the system)
+      pytest             - the test runner
+      httpx              - HTTP client library; FastAPI's TestClient needs
+                           it
+    NOTE from the README: webrtcvad still imports the old "pkg_resources",
+    so on a very new setuptools you may need "pip install setuptools<81".
+
+README.md
+    The full official documentation: overview, setup (local + Docker),
+    running the tests and the eval, the complete API contract (request
+    table, response field table, examples), all the architecture / design
+    decisions with their rationale, the privacy guarantees, the known
+    limitations, notes on scaling to 1000 concurrent calls, and a table of
+    the "bonus tasks" and their status. If in doubt, this is the source of
+    truth.
+
+Summary.txt
+    The authors' build DIARY. It walks through the project phase by phase
+    (Phase 1 skeleton, Phase 2 audio ingestion, Phase 3 model wrapper,
+    Phase 4 quality gate + real /analyze, Phase 5 reliability + logging +
+    Docker, Phase 6 tests + eval, Phase 8 WebSocket streaming) in plain
+    language, with the "in one line" summary and the commands used at each
+    step. Good for understanding HOW the project grew. This is the file you
+    had open in your editor.
+
+sample.wav
+    One bundled test clip: 91 KB, WAV, 16-bit, mono, 16 kHz, ~2.9 seconds.
+    It's the well-known "LDC93S1" TIMIT sentence, a ~46-year-old male
+    speaker. Used by the tests, the manual scripts, and the eval. Fun fact
+    the README admits: the model gets this particular clip WRONG.
+
+(Also present but not source: .model_cache/ = the downloaded 1.3 GB model,
+ myenv/ and .venv/ = local Python virtual environments, __pycache__/ =
+ Python's compiled bytecode, .pytest_cache/ = pytest's scratch data,
+ .DS_Store = macOS Finder cruft. None of these are "the project" - they're
+ generated/downloaded and are git-ignored.)
+
+
+===============================================================================
+ PART 4 - A REQUEST'S JOURNEY, STEP BY STEP
+===============================================================================
+
+Someone runs:   curl -X POST http://localhost:8000/analyze -F "audio=@sample.wav"
+
+  1. uvicorn (already running, model already loaded once at startup)
+     receives the HTTP request and hands it to FastAPI.
+
+  2. FastAPI matches the route "POST /analyze" -> calls analyze() in
+     app/api/routes.py. It also parses the multipart body and gives the
+     handler an "audio" UploadFile.
+
+  3. analyze() starts a stopwatch and mints request_id = uuid4().
+
+  4. raw_bytes = await audio.read()   <- the whole file, into memory.
+
+  5. It grabs the shared inferencer from app.state and calls
+     asyncio.wait_for(asyncio.to_thread(_run_pipeline, raw_bytes,
+     inferencer), timeout=3.0). So the heavy work runs on a worker thread
+     with a 3-second limit.
+
+  6. Inside _run_pipeline (the worker thread):
+       a. normalize_audio(raw_bytes)
+          -> spawns ffmpeg, pipes bytes in, gets a 16 kHz mono float32
+             numpy array back. (If this throws AudioDecodeError, step 7
+             catches it.)
+       b. run_vad(waveform, 16000)
+          -> webrtcvad over 30 ms frames -> {total_duration_s,
+             speech_duration_s, speech_ratio, num_speech_segments}.
+       c. assess_quality(vad_stats) -> "good" / "degraded" / "insufficient".
+       d. if "insufficient": return ("insufficient", all-unknown dict) -
+          the model is NOT called.
+          else: inferencer.predict(waveform, 16000)
+                -> feature-extract, ONE forward pass (timed), map the raw
+                   age scalar to a bracket + interiority confidence, map the
+                   gender softmax to male/female/unknown + its probability.
+                return ("good"/"degraded", prediction dict).
+
+  7. Back on the main path:
+       - If it timed out (>3s): log WARNING (timed_out, outcome
+         "degraded"), return the safe all-"unknown" HTTP 200 body. Done.
+       - If AudioDecodeError: log WARNING (decode_error, outcome
+         "degraded"), return HTTP 200 "insufficient" + unknowns. Done.
+       - Otherwise: build the AnalyzeResponse from the prediction dict,
+         stamp processing_ms (whole-pipeline wall clock).
+
+  8. Log exactly one line:
+       INFO  if quality == "good"   (outcome "ok")
+       WARNING if "degraded"/"insufficient" (outcome "degraded")
+     with contact_id, quality, predictions, confidences, inference_ms,
+     processing_ms.
+
+  9. Return HTTP 200 with the JSON body. curl prints it.
+
+ 10. If ANYTHING unexpected threw anywhere in steps 4-9, the outer
+     try/except catches it: log ERROR (outcome "error_fallback",
+     error_type), return HTTP 200 with all-"unknown" / "insufficient".
+     Still a 200. The phone call is never broken.
+
+
+===============================================================================
+ PART 5 - KEY DESIGN DECISIONS & TRADE-OFFS (the "why")
+===============================================================================
+
+* ONE wav2vec2 model with two heads, instead of two separate models or
+  hand-crafted acoustic features:
+    + The "robust" backbone was pre-trained on messy TELEPHONE speech, so it
+      degrades gracefully on call-center audio.
+    + One forward pass gives BOTH age and gender -> lower latency, less
+      memory.
+    - The cost: a wav2vec2 embedding is an opaque 1024-number vector. When
+      it's wrong there is nothing to inspect. Hand-crafted features
+      (openSMILE / eGeMAPS) would be interpretable (pitch, jitter,
+      shimmer...). For a soft hint where latency + robustness matter more
+      than explainability, they judged this the right trade. If it ever
+      needs to be audited per-decision, revisit that.
+
+* Load the model ONCE at startup, not per request:
+    Cold load ~6.3s (paid once, by the process, at boot). First warm request
+    ~2.2s. Steady state ~200-300ms. /health's model_loaded:true is the
+    signal an orchestrator should wait for before routing traffic.
+
+* Age is a REGRESSION, so age_confidence is a HEURISTIC, not a probability:
+    The age head emits a single number with no distribution. So there's no
+    honest probability to report. Instead they surface an "interiority"
+    proxy squeezed into [0.30, 0.65] - how central the predicted year is
+    within its bracket. It never approaches 1.0. Callers must NOT threshold
+    on it as if it were P(correct). Gender confidence, by contrast, IS a
+    real softmax probability (but only reported for male/female).
+
+* Gate on SPEECH RATIO only (not SNR/clipping/level):
+    The model tolerates low SNR (trained for it) far better than it
+    tolerates near-silence, where it produces confident-looking nonsense.
+    "Is there actually a voice here?" is the question that matters.
+
+* "insufficient" SHORT-CIRCUITS the model:
+    (1) saves the forward-pass compute on audio that can't yield a useful
+    answer, and (2) more importantly, running the model on silence yields a
+    confident-looking WRONG answer, which is worse than an honest "unknown"
+    for a downstream consumer that might act on it.
+
+* Never a 500, never a hang:
+    This is a soft personalization signal for a LIVE phone call. A bug in
+    it must not break the call. So: broad try/except -> always 200; hard 3s
+    budget in a worker thread -> always prompt.
+
+* Everything in memory, nothing logged:
+    Call recordings routinely contain PII and recording-consent limits. No
+    disk, no tempfile; ffmpeg over pipes; a fixed allow-list of log fields;
+    caller-supplied contact_id ignored so it can't be injected into logs.
+
+* Bake model weights into the Docker image at build time:
+    Bigger image + slower build, BUT first container start needs no internet
+    and is fast. The alternative (download on first start) makes the first
+    request block for seconds and fails outright with no network.
+
+
+===============================================================================
+ PART 6 - KNOWN LIMITATIONS (what is NOT done / NOT proven)
+===============================================================================
+
+Straight from the README and eval docs - be honest about these:
+
+* The eval is NOT statistically meaningful. As shipped the manifest has
+  N = 1 clip. Even at 10-20 clips it's an anecdote (±~25 points of error at
+  n=15). No class-balance check either.
+
+* On the one bundled clip (sample.wav, a ~46-year-old male), the model is
+  WRONG: it returns gender="unknown" (its internal "child" class wins) and
+  age_bracket="18-30". A concrete example of it struggling on short,
+  telephone-ish audio.
+
+* Accuracy on strong accents, heavy background noise (trucks, warehouses,
+  forklifts), very short utterances, and real telephony-compressed audio
+  (8 kHz G.711 mu-law/a-law) has NOT been measured. The ingestion layer has
+  code paths for mu-law/a-law but they've never been tested against real
+  SIP-trunk audio. Since the use case IS a call center, that's the biggest
+  gap.
+
+* age_bracket.confidence is a heuristic, not a calibrated probability.
+  Don't threshold on it as if it were P(correct).
+
+* Gender is binary + "unknown" only. The model was trained on binary gender
+  labels (its third class is "child", not a gender identity). It does NOT
+  represent nonbinary or other gender identities and must not be treated as
+  doing so. This is a training-data limitation, surfaced honestly.
+
+* The quality-gate thresholds (0.15, 0.5, 0.5s) are a hand-picked starting
+  point, never tuned on clips humans labeled good/degraded/insufficient.
+  The unit tests pin the boundaries so any retune is deliberate.
+
+* tests/test_schemas.py is an unwritten stub (the "1 skipped").
+
+* Common Voice (the natural source of labeled age/gender speech) is a GATED
+  Hugging Face dataset now (account + token + licence + multi-GB download),
+  so it was deliberately kept out of the zero-setup path. "python
+  eval/run_eval.py --help" prints the ~15 lines to wire it in.
+
+* Scaling: the current process is one uvicorn worker doing synchronous CPU
+  inference (~200-300ms/call), which caps a single process at a handful of
+  calls/second. Reaching ~1000 concurrent calls would need: batching
+  requests, a dedicated GPU inference server (Triton/TorchServe),
+  horizontal autoscaling of stateless API replicas behind a load balancer,
+  and model quantization (int8/fp16). None of that is built - it's
+  described in the README as the plan.
+
+===============================================================================
+ END
+===============================================================================
